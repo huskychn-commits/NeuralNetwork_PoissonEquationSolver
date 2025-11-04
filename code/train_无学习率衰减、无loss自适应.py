@@ -1,0 +1,321 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+import time
+import os
+import matplotlib
+
+# 解决中文显示问题
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+# 指定数学符号使用 STIX 字体（专门用于数学符号）
+matplotlib.rcParams['mathtext.fontset'] = 'stix'  # 使用 STIX 数学字体
+matplotlib.rcParams['axes.unicode_minus'] = False  # 可以保持 False
+
+# 解决OpenMP库冲突问题
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+class PINN(nn.Module):
+    """物理信息神经网络 - 用于求解三维泊松方程"""
+    
+    def __init__(self, hidden_layers=5, hidden_neurons=256):
+        super(PINN, self).__init__()
+        
+        # 输入层：3个坐标 (x, y, z)
+        self.input_layer = nn.Linear(3, hidden_neurons)
+        
+        # 隐藏层：5层，每层256个神经元
+        self.hidden_layers = nn.ModuleList()
+        for _ in range(hidden_layers):
+            self.hidden_layers.append(nn.Linear(hidden_neurons, hidden_neurons))
+        
+        # 输出层：1个输出 (电势φ)
+        self.output_layer = nn.Linear(hidden_neurons, 1)
+        
+        # 激活函数：全部使用tanh
+        self.activation = nn.Tanh()
+    
+    def forward(self, x):
+        # 输入层
+        x = self.activation(self.input_layer(x))
+        
+        # 隐藏层
+        for layer in self.hidden_layers:
+            x = self.activation(layer(x))
+        
+        # 输出层
+        x = self.output_layer(x)
+        return x
+
+def charge_density(x, y, z):
+    """电荷密度函数：ρ = 100 * x * y * z^2"""
+    return 100 * x * y * z**2
+
+def generate_samples(n_total=10000, ratio_boundary=0.005):
+    """
+    生成训练样本点
+    
+    参数:
+    n_total: 总采样点数
+    ratio_boundary: 每个边界面的采样比例
+    """
+    # 计算各类采样点数量
+    n_boundary_per_face = int(n_total * ratio_boundary)  # 每个面50个点
+    n_interior = n_total - 6 * n_boundary_per_face       # 体内9700个点
+    
+    # 生成体内采样点 (均匀分布在[-1,1]^3内)
+    interior_points = torch.rand(n_interior, 3) * 2 - 1
+    
+    # 生成边界采样点 (6个面)
+    boundary_points = []
+    
+    # x = -1 和 x = 1 边界
+    for x_val in [-1.0, 1.0]:
+        yz_points = torch.rand(n_boundary_per_face, 2) * 2 - 1
+        x_points = torch.full((n_boundary_per_face, 1), x_val)
+        face_points = torch.cat([x_points, yz_points], dim=1)
+        boundary_points.append(face_points)
+    
+    # y = -1 和 y = 1 边界
+    for y_val in [-1.0, 1.0]:
+        xz_points = torch.rand(n_boundary_per_face, 2) * 2 - 1
+        y_points = torch.full((n_boundary_per_face, 1), y_val)
+        face_points = torch.cat([xz_points[:, 0:1], y_points, xz_points[:, 1:2]], dim=1)
+        boundary_points.append(face_points)
+    
+    # z = -1 和 z = 1 边界
+    for z_val in [-1.0, 1.0]:
+        xy_points = torch.rand(n_boundary_per_face, 2) * 2 - 1
+        z_points = torch.full((n_boundary_per_face, 1), z_val)
+        face_points = torch.cat([xy_points, z_points], dim=1)
+        boundary_points.append(face_points)
+    
+    # 合并所有边界点
+    boundary_points = torch.cat(boundary_points, dim=0)
+    
+    # 合并所有点
+    all_points = torch.cat([interior_points, boundary_points], dim=0)
+    
+    # 打乱顺序
+    indices = torch.randperm(all_points.shape[0])
+    all_points = all_points[indices]
+    
+    # 分离体内点和边界点
+    interior_mask = torch.ones(n_total, dtype=torch.bool)
+    interior_mask[n_interior:] = False
+    
+    interior_points = all_points[interior_mask]
+    boundary_points = all_points[~interior_mask]
+    
+    return interior_points, boundary_points
+
+def compute_pde_loss(model, interior_points):
+    """计算PDE损失：Mean((∇²φ + ρ)²)"""
+    
+    # 需要计算二阶导数，设置requires_grad=True
+    interior_points.requires_grad_(True)
+    
+    # 计算神经网络输出
+    phi = model(interior_points)
+    
+    # 计算一阶导数 ∇φ
+    grad_phi = torch.autograd.grad(
+        phi, interior_points, 
+        grad_outputs=torch.ones_like(phi),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+    
+    # 计算二阶导数 ∇²φ
+    laplacian = 0.0
+    for i in range(3):  # 对x,y,z三个方向分别求二阶导
+        grad_component = grad_phi[:, i:i+1]
+        grad2_component = torch.autograd.grad(
+            grad_component, interior_points,
+            grad_outputs=torch.ones_like(grad_component),
+            create_graph=True,
+            retain_graph=True
+        )[0][:, i:i+1]
+        laplacian += grad2_component
+    
+    # 计算电荷密度
+    x, y, z = interior_points[:, 0:1], interior_points[:, 1:2], interior_points[:, 2:3]
+    rho = charge_density(x, y, z)
+    
+    # PDE残差：∇²φ + ρ
+    pde_residual = laplacian + rho
+    
+    # PDE损失：Mean((∇²φ + ρ)²)
+    pde_loss = torch.mean(pde_residual**2)
+    
+    return pde_loss
+
+def compute_boundary_loss(model, boundary_points):
+    """计算边界损失：Mean(φ²)"""
+    phi_boundary = model(boundary_points)
+    boundary_loss = torch.mean(phi_boundary**2)
+    return boundary_loss
+
+def train_model():
+    """训练神经网络模型"""
+    
+    # 设置设备 - 强制使用CPU以避免CUDA兼容性问题
+    device = torch.device('cpu')#('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device} ")
+    
+    # 初始化模型
+    model = PINN(hidden_layers=5, hidden_neurons=256).to(device)
+    
+    # 优化器
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    # 训练参数
+    n_sample_learn = 10000
+    beta = 1/2
+    error_epoch_lim = 1e-3
+    stable_count_required = 3
+    
+    # 训练记录
+    losses_total = []
+    losses_pde = []
+    losses_boundary = []
+    epochs = []
+    
+    # 手动终止标志
+    manual_stop = False
+    
+    # 设置绘图
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('PINN Training Progress')
+    ax.set_yscale('log')
+    
+    line_total, = ax.plot([], [], 'b-', label='Total Loss')
+    line_pde, = ax.plot([], [], 'r-', label='PDE Loss')
+    line_boundary, = ax.plot([], [], 'g-', label='Boundary Loss')
+    ax.legend()
+    ax.grid(True)
+    
+    # 添加手动终止按钮
+    ax_button = plt.axes([0.81, 0.02, 0.15, 0.05])  # [left, bottom, width, height]
+    stop_button = Button(ax_button, '停止训练')
+    
+    def stop_training(event):
+        nonlocal manual_stop
+        manual_stop = True
+        print("\n用户手动终止训练...")
+    
+    stop_button.on_clicked(stop_training)
+    
+    # 训练循环
+    epoch = 0
+    stable_count = 0
+    prev_loss = None
+    
+    print("开始训练...")
+    print("提示：点击图形上的'停止训练'按钮可以手动终止训练")
+    start_time = time.time()
+    
+    while True:
+        # 检查手动终止
+        if manual_stop:
+            print(f"\n训练被手动终止于第 {epoch} 个epoch")
+            break
+        # 生成新的采样点
+        interior_points, boundary_points = generate_samples(n_sample_learn, ratio_boundary=0.005)
+        interior_points = interior_points.to(device)
+        boundary_points = boundary_points.to(device)
+        
+        # 前向传播
+        loss_pde = compute_pde_loss(model, interior_points)
+        loss_boundary = compute_boundary_loss(model, boundary_points)
+        loss_total = loss_pde + beta * loss_boundary
+        
+        # 反向传播
+        optimizer.zero_grad()
+        loss_total.backward()
+        optimizer.step()
+        
+        # 记录损失
+        losses_total.append(loss_total.item())
+        losses_pde.append(loss_pde.item())
+        losses_boundary.append(loss_boundary.item())
+        epochs.append(epoch)
+        
+        # 更新绘图
+        if epoch % 10 == 0:  # 每10个epoch更新一次绘图
+            line_total.set_data(epochs, losses_total)
+            line_pde.set_data(epochs, losses_pde)
+            line_boundary.set_data(epochs, losses_boundary)
+            ax.relim()
+            ax.autoscale_view()
+            plt.draw()
+            plt.pause(0.01)
+        
+        # 检查停止条件
+        if prev_loss is not None:
+            relative_error = abs(loss_total.item() - prev_loss) / abs(prev_loss)
+            if relative_error < error_epoch_lim:
+                stable_count += 1
+                print(f"Epoch {epoch}: Loss = {loss_total.item():.6e}, 相对误差 = {relative_error:.6e}, 稳定计数 = {stable_count}")
+                
+                if stable_count >= stable_count_required:
+                    print(f"\n训练完成！达到停止条件：连续{stable_count_required}次相对误差 < {error_epoch_lim}")
+                    break
+            else:
+                stable_count = 0
+                if epoch % 100 == 0:  # 每100个epoch打印一次进度
+                    print(f"Epoch {epoch}: Loss = {loss_total.item():.6e}, 相对误差 = {relative_error:.6e}")
+        else:
+            if epoch % 100 == 0:
+                print(f"Epoch {epoch}: Loss = {loss_total.item():.6e}")
+        
+        prev_loss = loss_total.item()
+        epoch += 1
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    print(f"训练耗时: {training_time:.2f} 秒")
+    print(f"总训练轮数: {epoch}")
+    
+    # 保存模型到当前文件夹
+    model_path = 'pinn.pth'
+    torch.save(model.state_dict(), model_path)
+    print(f"模型已保存到 {os.path.abspath(model_path)}")
+    
+    # 训练完成后保持图像显示但不阻塞程序
+    if manual_stop:
+        print("\n训练已手动终止！图像窗口保持显示，您可以查看训练曲线。")
+    else:
+        print("\n训练已完成！图像窗口保持显示，您可以查看训练曲线。")
+    print("关闭图像窗口后程序将继续执行。")
+    plt.ioff()
+    plt.show(block=True)  # block=True 确保图像窗口保持显示直到用户手动关闭
+    
+    # 弹出训练完成提示，同时在控制台打印
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()  # 隐藏主窗口
+        if manual_stop:
+            message_text = f"PINN训练已手动终止！\n总轮数: {epoch}\n训练时间: {training_time:.2f}秒"
+            messagebox.showinfo("训练终止", message_text)
+        else:
+            message_text = f"PINN训练已完成！\n总轮数: {epoch}\n训练时间: {training_time:.2f}秒"
+            messagebox.showinfo("训练完成", message_text)
+        root.destroy()
+    except:
+        if manual_stop:
+            print("训练已手动终止！")
+        else:
+            print("训练完成！")
+    
+    return model, losses_total, losses_pde, losses_boundary, epochs
+
+if __name__ == "__main__":
+    # 训练模型
+    model, losses_total, losses_pde, losses_boundary, epochs = train_model()
