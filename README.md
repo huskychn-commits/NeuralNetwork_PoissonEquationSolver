@@ -139,8 +139,8 @@ python exam_absulote.py
 - **自适应采样版本**: 训练效率最高，收敛效果最好
 
 ### 2. 新版本模型更新说明
-**更新时间**: 2024年11月12日  
-**新模型位置**: `/home/stu2200011534/assignments/assignment3/result/pinn_new.pth`
+**更新时间**: 2025年11月12日  
+**新模型位置**: `result/pinn_new.pth`
 
 **具体更改内容**:
 - **超参数优化**: 更新了自适应采样机制的关键参数
