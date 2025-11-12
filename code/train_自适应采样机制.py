@@ -203,9 +203,10 @@ def train_model():
     
     # 训练参数
     n_sample_learn = 10000
-    beta = 1  # 边缘权重调控参数
+    beta = 10  # 边缘权重调控参数
     error_epoch_lim = 1e-3
     stable_count_required = 3
+    max_epochs = 2000  # 最大训练轮次上限
     
     # 学习率衰减参数
     lr_decay_start_epoch = 400    # 400个epoch后开始学习率衰减
@@ -214,7 +215,7 @@ def train_model():
     lr_decay_factor = 0.997       # 学习率衰减因子（每次乘以0.997）
 
     # 采样比例自适应参数
-    base_ratio = 0.05  # 基础边缘占比
+    base_ratio = 0.1  # 基础边缘占比
     boundary_ratio_upper_limit = 1/7  # 边缘占比的上限
     improvement_threshold_factor = 1.1  # 改进阈值因子
     sr_adapt_factor = 1.05  # 采样比例自适应因子
@@ -288,6 +289,11 @@ def train_model():
         # 检查手动终止
         if manual_stop:
             print(f"\n训练被手动终止于第 {epoch} 个epoch")
+            break
+        
+        # 检查轮次上限
+        if epoch >= max_epochs:
+            print(f"\n达到最大训练轮次上限：{max_epochs}")
             break
         # 自适应采样机制
         if epoch >= lr_decay_start_epoch and len(losses_total) >= 2 * lookback_window:
